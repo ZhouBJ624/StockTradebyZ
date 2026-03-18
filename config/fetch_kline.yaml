@@ -15,7 +15,6 @@ stocklist: "./pipeline/stocklist.csv"
 #   bj   — 北交所（4/8 开头，后缀 .BJ）
 # 如需全部保留，设为空列表 []
 exclude_boards:
-  - gem
   - star
   - bj
 

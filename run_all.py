@@ -127,11 +127,11 @@ def main() -> None:
             [PYTHON, str(ROOT / "dashboard" / "export_kline_charts.py")],
         )
 
-    # ── 步骤 4：Gemini 图表分析 ──────────────────────────────────────
+    # ── 步骤 4：TRADE 内置 AI 图表分析 ──────────────────────────────────────
     if start <= 4:
         _run(
-            "4/4  Gemini 图表分析（gemini_review）",
-            [PYTHON, str(ROOT / "agent" / "gemini_review.py")],
+            "4/4  TRADE 内置 AI 图表分析（trae_review）",
+            [PYTHON, str(ROOT / "agent" / "trae_review.py")],
         )
 
     # ── 步骤 5：打印推荐结果 ─────────────────────────────────────────

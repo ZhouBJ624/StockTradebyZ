@@ -92,6 +92,40 @@ BAN_PATTERNS = (
     "max retries exceeded"
 )
 
+class RateLimiter:
+    """速率限制器，严格控制请求间隔为固定时间。"""
+    def __init__(self, interval_seconds=1.2):
+        self.interval = interval_seconds
+        self.last_request_time = 0
+        self.lock = None
+        try:
+            import threading
+            self.lock = threading.Lock()
+        except ImportError:
+            pass
+    
+    def wait(self):
+        """严格控制每次请求间隔为指定时间。"""
+        if self.lock:
+            self.lock.acquire()
+        
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        
+        if elapsed < self.interval:
+            wait_time = self.interval - elapsed
+            logger.debug(f"速率限制：等待 {wait_time:.2f} 秒")
+            time.sleep(wait_time)
+            current_time = time.time()
+        
+        self.last_request_time = current_time
+        
+        if self.lock:
+            self.lock.release()
+
+# 创建全局速率限制器实例，严格控制间隔 1.2 秒
+rate_limiter = RateLimiter(interval_seconds=1.2)
+
 def _looks_like_ip_ban(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
     return any(pat in msg for pat in BAN_PATTERNS)
@@ -128,6 +162,8 @@ def _to_ts_code(code: str) -> str:
 def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
     ts_code = _to_ts_code(code)
     try:
+        # 使用速率限制器，确保不超过每分钟 50 次请求
+        rate_limiter.wait()
         df = ts.pro_bar(
             ts_code=ts_code,
             adj="qfq",
@@ -151,6 +187,23 @@ def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
     for c in ["open", "close", "high", "low", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.sort_values("date").reset_index(drop=True)
+
+def get_latest_date_from_csv(csv_path: Path) -> Optional[pd.Timestamp]:
+    """从现有CSV文件获取最新交易日期。"""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return None
+    try:
+        df = pd.read_csv(csv_path, usecols=["date"])
+        if df.empty:
+            return None
+        dates = pd.to_datetime(df["date"], errors="coerce")
+        dates = dates.dropna()
+        if dates.empty:
+            return None
+        return dates.max()
+    except Exception:
+        return None
+
 
 def validate(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -188,7 +241,7 @@ def load_codes_from_stocklist(stocklist_csv: Path, exclude_boards: set[str]) -> 
                 stocklist_csv, len(codes), ",".join(sorted(exclude_boards)) or "无")
     return codes
 
-# --------------------------- 单只抓取（全量覆盖保存） --------------------------- #
+# --------------------------- 单只抓取（增量更新） --------------------------- #
 def fetch_one(
     code: str,
     start: str,
@@ -196,15 +249,37 @@ def fetch_one(
     out_dir: Path,
 ):
     csv_path = out_dir / f"{code}.csv"
+    today = pd.Timestamp.today().normalize()
+    latest_existing_date = get_latest_date_from_csv(csv_path)
+
+    if latest_existing_date is not None:
+        latest_existing_date = latest_existing_date.normalize()
+        if latest_existing_date >= today:
+            logger.debug("%s 已是最新（最新日期: %s），跳过", code, latest_existing_date.date())
+            return
+        fetch_start = (latest_existing_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    else:
+        fetch_start = start
 
     for attempt in range(1, 4):
         try:
-            new_df = _get_kline_tushare(code, start, end)
+            new_df = _get_kline_tushare(code, fetch_start, end)
             if new_df.empty:
-                logger.debug("%s 无数据，生成空表。", code)
-                new_df = pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+                logger.debug("%s 无新数据，跳过", code)
+                return
+            
+            if latest_existing_date is not None:
+                existing_df = pd.read_csv(csv_path)
+                existing_df["date"] = pd.to_datetime(existing_df["date"])
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                combined_df = combined_df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
+                new_df = combined_df
+            
             new_df = validate(new_df)
-            new_df.to_csv(csv_path, index=False)  # 直接覆盖保存
+            new_df.to_csv(csv_path, index=False)
+            logger.debug("%s 更新完成（%s → %s）", code, 
+                        new_df["date"].min().date() if not new_df.empty else "N/A",
+                        new_df["date"].max().date() if not new_df.empty else "N/A")
             break
         except Exception as e:
             if _looks_like_ip_ban(e):
@@ -249,9 +324,8 @@ def main(log_path: Optional[Path] = None):
     ts_token = os.environ.get("TUSHARE_TOKEN")
     if not ts_token:
         raise ValueError("请先设置环境变量 TUSHARE_TOKEN，例如：export TUSHARE_TOKEN=你的token")
-    ts.set_token(ts_token)
     global pro
-    pro = ts.pro_api()
+    pro = ts.pro_api(ts_token)
 
     # ---------- 日期解析 ---------- #
     raw_start = str(cfg.get("start", "20190101"))

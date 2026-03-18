@@ -1,8 +1,8 @@
 numba==0.64.0
 numpy==2.4.3
-pandas==3.0.1
+pandas
 plotly==6.5.0
-protobuf==7.34.0
+protobuf
 PyYAML==6.0.3
 streamlit==1.55.0
 tqdm==4.67.3
