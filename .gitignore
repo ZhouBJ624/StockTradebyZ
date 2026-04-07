@@ -3,11 +3,15 @@
 *.pyo
 *.pyd
 *.py,cover
+*.zip
 __pycache__/
 
 # Project folders
 .vscode/
 data/
+models/
+llama-cpu/
+llama-vulkan/
 
 # Virtual environments
 .venv/

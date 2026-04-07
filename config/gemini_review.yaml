@@ -16,8 +16,8 @@ prompt_path: agent/prompt.md
 # Gemini 模型名称
 model: gemini-3.1-pro-preview
 
-# 相邻 API 调用间隔（秒）
-request_delay: 5
+# 相邻 API 调用间隔（秒）- 增加给 Ollama 更多缓冲时间
+request_delay: 10
 
 # true: 跳过已存在单股 JSON（断点续跑）
 skip_existing: false

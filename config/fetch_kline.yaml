@@ -22,4 +22,4 @@ exclude_boards:
 out: "./data/raw"
 
 # 并发下载线程数
-workers: 8
+workers: 1

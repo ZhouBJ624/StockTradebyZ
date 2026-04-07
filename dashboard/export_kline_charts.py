@@ -68,7 +68,7 @@ def _export_fig(fig, out_path: Path, width: int, height: int) -> None:
         format="jpg",
         width=width,
         height=height,
-        scale=2,        # 2× 分辨率，适合屏幕阅读
+        scale=1,        # 1× 输出，不放大
     )
 
 
@@ -81,10 +81,10 @@ CONFIG = {
     "out_dir":    str(_ROOT / "data" / "kline"),
     "bars":       120,   # 日线显示 K 线数量（0 = 全部）
     "weekly_bars": 60,   # 周线显示 K 线数量（0 = 全部）
-    "day_width":  1400,
-    "day_height": 700,
-    "week_width": 1400,
-    "week_height": 700,
+    "day_width":  933,   # 日线宽度（原 1400 的 2/3）
+    "day_height": 467,   # 日线高度（原 700 的 2/3）
+    "week_width": 933,   # 周线宽度（原 1400 的 2/3）
+    "week_height": 467,  # 周线高度（原 700 的 2/3）
 }
 
 
