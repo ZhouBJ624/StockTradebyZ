@@ -7,16 +7,15 @@ start: "20190101"
 end: "today"
 
 # 股票清单 CSV 路径（需含 ts_code 与 symbol 列）
-stocklist: "./pipeline/stocklist.csv"
+stocklist: "./pipeline/stocklist_hs300_zz500.csv"
 
 # 排除板块，可选值：
 #   gem  — 创业板（300/301 开头，后缀 .SZ）
 #   star — 科创板（688 开头，后缀 .SH）
 #   bj   — 北交所（4/8 开头，后缀 .BJ）
 # 如需全部保留，设为空列表 []
-exclude_boards:
-  - star
-  - bj
+# 股票池为沪深300+中证500，并按下方 exclude_boards 排除科创板与北交所（800 只 → 709 只）
+exclude_boards: ["star", "bj"]
 
 # K线数据输出目录
 out: "./data/raw"

@@ -21,7 +21,7 @@ import pandas as pd
 import yaml 
 
 from schemas import Candidate
-from Selector import B1Selector, BrickChartSelector
+from Selector import B1Selector, BrickChartSelector, FormulaSelector
 from pipeline_core import MarketDataPreparer, TopTurnoverPoolBuilder
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,10 @@ def _calc_warmup(cfg: dict, buffer: int) -> int:
             int(cfg_brick.get("zxdkx_m4", 114)) + buffer,
         )
 
+    cfg_formulas = cfg.get("formulas", {})
+    if cfg_formulas.get("enabled", True):
+        warmup = max(warmup, int(cfg_formulas.get("warmup_bars", 400)) + buffer)
+
     return warmup
 
 
@@ -271,6 +275,82 @@ def run_brick(
 
 
 # =============================================================================
+# 公式策略（f1~f5）
+# =============================================================================
+
+def _cap_by_formula(candidates: List[Candidate], caps: dict) -> List[Candidate]:
+    """每条公式内按成交额降序取前 N，取并集.
+
+    - 命中多条公式的股票，只要任一命中公式入选即保留。
+    - 未在 caps 中列出的公式不做截断（其全部成员保留）。
+    """
+    by_formula: Dict[str, List[Candidate]] = {}
+    keep_uncapped: set = set()
+    for c in candidates:
+        tokens = (c.extra or {}).get("formulas", []) or [c.strategy]
+        for f in tokens:
+            if f in caps:
+                by_formula.setdefault(f, []).append(c)
+            else:
+                keep_uncapped.add(c.code)
+
+    kept: set = set(keep_uncapped)
+    for f, n in caps.items():
+        group = sorted(by_formula.get(f, []), key=lambda c: c.turnover_n or 0.0, reverse=True)
+        for c in group[: int(n)]:
+            kept.add(c.code)
+
+    return [c for c in candidates if c.code in kept]
+
+
+def run_formulas(
+    prepared: Dict[str, pd.DataFrame],
+    pick_date: pd.Timestamp,
+    pool_codes: List[str],
+    cfg_formulas: dict,
+) -> List[Candidate]:
+    """在流动性池内运行 f1~f5 选股公式，命中任一即入选.
+
+    同一只股票命中多条公式时，按 f1→f5 顺序取第一条作为来源策略。
+    可选按 ``max_per_formula`` 在每条公式内按成交额取前 N 只以控制规模。
+    """
+    selector = FormulaSelector(cfg_formulas)
+
+    date_str = pick_date.strftime("%Y-%m-%d")
+    candidates: List[Candidate] = []
+
+    for code in pool_codes:
+        df = prepared.get(code)
+        if df is None or pick_date not in df.index:
+            continue
+        try:
+            pf = selector.prepare_df(df)
+            hits = selector.matched_formulas(pf, pick_date)
+            if not hits:
+                continue
+            row = pf.loc[pick_date]
+            candidates.append(Candidate(
+                code=code,
+                date=date_str,
+                strategy=hits[0],
+                close=float(row["close"]),
+                turnover_n=float(row["turnover_n"]),
+                extra={"formulas": hits},
+            ))
+        except Exception as exc:
+            logger.debug("Formula skip %s: %s", code, exc)
+
+    raw_n = len(candidates)
+    caps = cfg_formulas.get("max_per_formula") or {}
+    if caps:
+        candidates = _cap_by_formula(candidates, caps)
+        logger.info("公式选出（截断前）: %d 只 → 截断后: %d 只", raw_n, len(candidates))
+    else:
+        logger.info("公式选出: %d 只", len(candidates))
+    return candidates
+
+
+# =============================================================================
 # 主入口
 # =============================================================================
 
@@ -335,6 +415,10 @@ def run_preselect(
 
     if cfg.get("brick", {}).get("enabled", True):
         all_candidates.extend(run_brick(prepared, pick_ts, pool_codes, cfg["brick"]))
+
+    cfg_formulas = cfg.get("formulas")
+    if cfg_formulas and cfg_formulas.get("enabled", True):
+        all_candidates.extend(run_formulas(prepared, pick_ts, pool_codes, cfg_formulas))
 
     # 7) 去重（同一只保留首次命中的策略）
     seen: set = set()

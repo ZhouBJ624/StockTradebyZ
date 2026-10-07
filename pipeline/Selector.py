@@ -243,6 +243,106 @@ def compute_brick_chart(
     return pd.Series(arr, index=df.index, name="brick")
 
 
+def compute_macd(
+    df: pd.DataFrame,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> pd.DataFrame:
+    """MACD：DIF = EMA(fast) - EMA(slow)，DEA = EMA(DIF, signal)。"""
+    close = df["close"].astype(float)
+    e_fast = close.ewm(span=fast, adjust=False).mean()
+    e_slow = close.ewm(span=slow, adjust=False).mean()
+    dif = e_fast - e_slow
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    return df.assign(DIF=dif, DEA=dea)
+
+
+def compute_bbi(df: pd.DataFrame, periods: tuple = (3, 6, 12, 24)) -> pd.Series:
+    """BBI = (MA3 + MA6 + MA12 + MA24) / 4。"""
+    close = df["close"].astype(float)
+    total = None
+    for p in periods:
+        p = int(p)
+        ma = close.rolling(p, min_periods=p).mean()
+        total = ma if total is None else total + ma
+    return (total / len(periods)).rename("BBI")
+
+
+def _daily_index(df: pd.DataFrame) -> pd.DatetimeIndex:
+    """取日线 DatetimeIndex（没有 DatetimeIndex 时退回 date 列）。"""
+    if isinstance(df.index, pd.DatetimeIndex):
+        return pd.DatetimeIndex(df.index)
+    return pd.DatetimeIndex(pd.to_datetime(df["date"]))
+
+
+def _week_keys(index: pd.DatetimeIndex) -> np.ndarray:
+    """ISO 年-周 键，口径与 compute_weekly_close 保持一致。"""
+    iso = index.isocalendar()
+    return (iso.year.astype(str) + "-" + iso.week.astype(str).str.zfill(2)).to_numpy()
+
+
+def _weekly_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """日线 → 周线 OHLC，index 为每周最后一个真实交易日。"""
+    src = df if isinstance(df.index, pd.DatetimeIndex) else df.set_index("date")
+    idx = pd.DatetimeIndex(src.index)
+    keys = _week_keys(idx)
+    g = src.groupby(keys)
+    weekly = pd.DataFrame({
+        "open":  g["open"].first(),
+        "high":  g["high"].max(),
+        "low":   g["low"].min(),
+        "close": g["close"].last(),
+    })
+    last_date = pd.Series(idx, index=range(len(idx))).groupby(keys).last()
+    weekly.index = pd.DatetimeIndex(last_date.to_numpy())
+    return weekly.sort_index().dropna()
+
+
+def weekly_indicators_daily(
+    df: pd.DataFrame,
+    *,
+    macd_params: Optional[dict] = None,
+    bbi_periods: tuple = (3, 6, 12, 24),
+    kdj_n: int = 9,
+    cross_lookback_weeks: int = 1,
+) -> Dict[str, pd.Series]:
+    """周线指标（KDJ 的 J、MACD 的 DIF/DEA、BBI、MACD 金叉）对齐到日线 index。
+
+    周线值以「每周最后一个交易日的取值」向前填充到日线，
+    因此选股日取到的是截至当日最近一根周线（可能是未走完的当周）的值。
+    """
+    macd_params = dict(macd_params or {})
+    d_index = _daily_index(df)
+    weeks = _weekly_frame(df)
+
+    if weeks.empty:
+        nan_s = pd.Series(np.nan, index=d_index)
+        return {
+            "wJ": nan_s, "wDIF": nan_s, "wDEA": nan_s, "wBBI": nan_s,
+            "wCross": pd.Series(False, index=d_index),
+        }
+
+    w_kdj = compute_kdj(weeks, n=kdj_n)["J"]
+    w_macd = compute_macd(weeks, **macd_params)
+    w_bbi = compute_bbi(weeks, periods=bbi_periods)
+
+    lookback = max(1, int(cross_lookback_weeks))
+    cross = (w_macd["DIF"] > w_macd["DEA"]) & (w_macd["DIF"].shift(1) <= w_macd["DEA"].shift(1))
+    if lookback > 1:
+        cross = cross.astype(float).rolling(lookback, min_periods=1).max() > 0
+
+    def _to_daily(s: pd.Series) -> pd.Series:
+        return s.reindex(d_index).ffill()
+
+    return {
+        "wJ":     _to_daily(w_kdj),
+        "wDIF":   _to_daily(w_macd["DIF"]),
+        "wDEA":   _to_daily(w_macd["DEA"]),
+        "wBBI":   _to_daily(w_bbi),
+        "wCross": _to_daily(cross.astype(float)).fillna(0.0).astype(bool),
+    }
+
 
 # =============================================================================
 # Protocol / 基类
@@ -931,6 +1031,143 @@ class BrickChartSelector(PipelineSelector):
             val = float(hist["brick_growth"].iloc[-1])
             return val if np.isfinite(val) else -np.inf
         return float(self._pattern_filter.brick_growth_arr(hist)[-1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FormulaSelector
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FormulaSelector(PipelineSelector):
+    """5 条选股公式（各自独立，命中任一即入选，取并集）。
+
+      f1  J<12 且 -2<涨跌幅<2 且 (DIF>0 或 DEA>0) 且 BBI>MA60
+      f2  DIF>0 且 DEA>0 且 (DIF<0.2 或 DEA<0.2) 且 J<20 且 DIF<DEA
+          且 BBI>MA60 且 -2<涨跌幅<2
+      f3  (DIF<0 或 DEA<0) 且 DIF>DEA 且 J<30 且 BBI>MA5
+      f4  日线 J<10 且 周线 J<0
+      f5  周线 DIF 上穿 DEA 且 (周线 DIF>0 或 周线 DEA>0) 且 周线 BBI>MA60
+
+    ``prepare_df()`` 一次算完所有指标，并把每条公式的命中掩码写成
+    ``f1_mask``…``f5_mask`` 列，``_vec_pick`` 为 5 条公式的并集。
+    """
+
+    _FORMULAS = ("f1", "f2", "f3", "f4", "f5")
+
+    def __init__(self, params: Optional[dict] = None, *, date_col: str = "date") -> None:
+        p = dict(params or {})
+        self.macd_params = {"fast": 12, "slow": 26, "signal": 9, **(p.get("macd") or {})}
+        self.bbi_periods = tuple((p.get("bbi") or {}).get("periods", (3, 6, 12, 24)))
+        self.kdj_n = int(p.get("kdj_n", 9))
+
+        self.cfg = {name: dict(p.get(name) or {}) for name in self._FORMULAS}
+        self.enabled = [n for n in self._FORMULAS if self.cfg[n].get("enabled", True)]
+        self.ma_periods = sorted({
+            int(self.cfg["f1"].get("bbi_ma", 60)),
+            int(self.cfg["f2"].get("bbi_ma", 60)),
+            int(self.cfg["f3"].get("bbi_ma", 5)),
+            int(self.cfg["f5"].get("bbi_ma", 60)),
+        })
+
+        super().__init__(filters=[], date_col=date_col, min_bars=60, extra_bars_buffer=20)
+
+    # ── 单条公式掩码 ─────────────────────────────────────────────────────────
+
+    def _f1_mask(self, df: pd.DataFrame) -> pd.Series:
+        c = self.cfg["f1"]
+        return (
+            (df["J"] < float(c.get("j_max", 12)))
+            & (df["pct_chg"] > float(c.get("chg_min", -2)))
+            & (df["pct_chg"] < float(c.get("chg_max", 2)))
+            & ((df["DIF"] > 0) | (df["DEA"] > 0))
+            & (df["BBI"] > df[f"MA{int(c.get('bbi_ma', 60))}"])
+        )
+
+    def _f2_mask(self, df: pd.DataFrame) -> pd.Series:
+        c = self.cfg["f2"]
+        abs_max = float(c.get("dif_dea_abs_max", 0.2))
+        return (
+            (df["DIF"] > 0)
+            & (df["DEA"] > 0)
+            & ((df["DIF"] < abs_max) | (df["DEA"] < abs_max))
+            & (df["J"] < float(c.get("j_max", 20)))
+            & (df["DIF"] < df["DEA"])
+            & (df["BBI"] > df[f"MA{int(c.get('bbi_ma', 60))}"])
+            & (df["pct_chg"] > float(c.get("chg_min", -2)))
+            & (df["pct_chg"] < float(c.get("chg_max", 2)))
+        )
+
+    def _f3_mask(self, df: pd.DataFrame) -> pd.Series:
+        c = self.cfg["f3"]
+        return (
+            ((df["DIF"] < 0) | (df["DEA"] < 0))
+            & (df["DIF"] > df["DEA"])
+            & (df["J"] < float(c.get("j_max", 30)))
+            & (df["BBI"] > df[f"MA{int(c.get('bbi_ma', 5))}"])
+        )
+
+    def _f4_mask(self, df: pd.DataFrame) -> pd.Series:
+        c = self.cfg["f4"]
+        return (
+            (df["J"] < float(c.get("daily_j_max", 10)))
+            & (df["wJ"] < float(c.get("weekly_j_max", 0)))
+        )
+
+    def _f5_mask(self, df: pd.DataFrame) -> pd.Series:
+        c = self.cfg["f5"]
+        return (
+            df["wCross"]
+            & ((df["wDIF"] > 0) | (df["wDEA"] > 0))
+            & (df["wBBI"] > df[f"MA{int(c.get('bbi_ma', 60))}"])
+        )
+
+    # ── 预计算 ───────────────────────────────────────────────────────────────
+
+    def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """预计算日线/周线指标与 5 条公式掩码，``_vec_pick`` 为并集。"""
+        df = df.copy()
+
+        kdj = compute_kdj(df, n=self.kdj_n)
+        df["K"], df["D"], df["J"] = kdj["K"], kdj["D"], kdj["J"]
+
+        macd = compute_macd(df, **self.macd_params)
+        df["DIF"], df["DEA"] = macd["DIF"], macd["DEA"]
+
+        df["BBI"] = compute_bbi(df, periods=self.bbi_periods)
+        close = df["close"].astype(float)
+        for p in self.ma_periods:
+            df[f"MA{p}"] = close.rolling(p, min_periods=p).mean()
+        df["pct_chg"] = close.pct_change() * 100.0
+
+        weekly = weekly_indicators_daily(
+            df,
+            macd_params=self.macd_params,
+            bbi_periods=self.bbi_periods,
+            kdj_n=self.kdj_n,
+            cross_lookback_weeks=int(self.cfg["f5"].get("cross_lookback_weeks", 1)),
+        )
+        for key, series in weekly.items():
+            df[key] = series.to_numpy()
+
+        masks = {
+            "f1": self._f1_mask(df),
+            "f2": self._f2_mask(df),
+            "f3": self._f3_mask(df),
+            "f4": self._f4_mask(df),
+            "f5": self._f5_mask(df),
+        }
+
+        union = np.zeros(len(df), dtype=bool)
+        for name in self._FORMULAS:
+            m = masks[name].to_numpy(dtype=bool) if name in self.enabled else np.zeros(len(df), dtype=bool)
+            df[f"{name}_mask"] = m
+            union |= m
+        df["_vec_pick"] = union
+        return df
+
+    def matched_formulas(self, pf: pd.DataFrame, date: pd.Timestamp) -> List[str]:
+        """返回选股日命中的公式名列表（按 f1~f5 顺序，仅含已启用公式）。"""
+        row = pf.loc[date]
+        return [n for n in self.enabled if bool(row.get(f"{n}_mask", False))]
 
 
 # =============================================================================

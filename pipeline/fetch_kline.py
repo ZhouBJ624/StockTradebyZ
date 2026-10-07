@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import logging
 import random
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
-import os
 
 import pandas as pd
-import tushare as ts
+import akshare as ak
+import requests
 import yaml
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
 # --------------------------- pandas 兼容补丁 --------------------------- #
-# tushare 内部使用了 fillna(method='ffill'/'bfill')，在 pandas 2.2+ 中已移除该参数。
+# 部分第三方库仍使用 fillna(method='ffill'/'bfill')，在 pandas 2.2+ 中已移除该参数。
 # 此补丁将旧式调用自动转发到 ffill()/bfill()，无需降级 pandas。
 import pandas as _pd
 
@@ -140,37 +142,57 @@ def _cool_sleep(base_seconds: int) -> None:
     logger.warning("疑似被限流/封禁，进入冷却期 %d 秒...", sleep_s)
     time.sleep(sleep_s)
 
-# --------------------------- 历史K线（Tushare 日线，固定qfq） --------------------------- #
-pro: Optional[ts.pro_api] = None  # 模块级会话
+# --------------------------- 历史K线（多数据源，固定 qfq） --------------------------- #
+def set_api(session=None) -> None:
+    """兼容旧接口：AkShare 无需注入会话，保留此函数以免外部调用报错。"""
+    return
 
-def set_api(session) -> None:
-    """由外部(比如GUI)注入已创建好的 ts.pro_api() 会话"""
-    global pro
-    pro = session
-    
 
-def _to_ts_code(code: str) -> str:
-    """把6位code映射到标准 ts_code 后缀。"""
-    code = str(code).zfill(6)
-    if code.startswith(("60", "68", "9")):
-        return f"{code}.SH"
-    elif code.startswith(("4", "8")):
-        return f"{code}.BJ"
-    else:
-        return f"{code}.SZ"
+_KLINE_COLUMNS = ["date", "open", "close", "high", "low", "volume"]
 
-def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
-    ts_code = _to_ts_code(code)
+
+def _to_market_symbol(code: str) -> str:
+    """把 6 位代码转成带市场前缀的形式（腾讯/新浪接口需要）。"""
+    s = str(code).zfill(6)
+    if s.startswith("6"):
+        return f"sh{s}"
+    if s.startswith(("0", "3")):
+        return f"sz{s}"
+    if s.startswith(("4", "8")):
+        return f"bj{s}"
+    return f"sh{s}"
+
+
+def _normalize_ohlcv(df: pd.DataFrame, volume_in_shares: bool = False) -> pd.DataFrame:
+    """统一成 date/open/close/high/low/volume，成交量口径统一为「手」（与东财一致）。
+
+    volume_in_shares=True 时，输入成交量单位为「股」，需除以 100 换成「手」。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=_KLINE_COLUMNS)
+    df = df[_KLINE_COLUMNS].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ["open", "close", "high", "low", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if volume_in_shares:
+        df["volume"] = df["volume"] / 100.0
+    return (df.dropna(subset=["date"])
+              .drop_duplicates(subset="date")
+              .sort_values("date")
+              .reset_index(drop=True))
+
+
+def _get_kline_em(code: str, start: str, end: str) -> pd.DataFrame:
+    """源1：东方财富（AkShare stock_zh_a_hist），成交量单位：手。"""
+    symbol = str(code).zfill(6)
     try:
-        # 使用速率限制器，确保不超过每分钟 50 次请求
         rate_limiter.wait()
-        df = ts.pro_bar(
-            ts_code=ts_code,
-            adj="qfq",
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
             start_date=start,
             end_date=end,
-            freq="D",
-            api=pro
+            adjust="qfq",
         )
     except Exception as e:
         if _looks_like_ip_ban(e):
@@ -178,15 +200,100 @@ def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
         raise
 
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_KLINE_COLUMNS)
 
-    df = df.rename(columns={"trade_date": "date", "vol": "volume"})[
-        ["date", "open", "close", "high", "low", "volume"]
-    ].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    for c in ["open", "close", "high", "low", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.sort_values("date").reset_index(drop=True)
+    df = df.rename(columns={
+        "日期": "date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+    })
+    return _normalize_ohlcv(df)
+
+
+_TX_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+_TX_MAX_COUNT = 640       # 单次请求返回上限，超过上限会被静默截断
+_TX_WINDOW_YEARS = 2      # 每次请求覆盖的年份数（2 年约 490 个交易日，安全小于上限）
+
+
+def _get_kline_tx(code: str, start: str, end: str) -> pd.DataFrame:
+    """源2：腾讯行情（按时间窗分片请求），成交量单位：手。"""
+    symbol = _to_market_symbol(code)
+    start_dt = dt.datetime.strptime(str(start), "%Y%m%d").date()
+    end_dt = dt.datetime.strptime(str(end), "%Y%m%d").date()
+
+    frames = []
+    with requests.Session() as sess:
+        sess.headers.update({"User-Agent": "Mozilla/5.0"})
+        for year in range(start_dt.year, end_dt.year + 1, _TX_WINDOW_YEARS):
+            win_end = min(year + _TX_WINDOW_YEARS - 1, end_dt.year)
+            rate_limiter.wait()
+            resp = sess.get(
+                _TX_URL,
+                params={"param": f"{symbol},day,{year}-01-01,{win_end}-12-31,{_TX_MAX_COUNT},qfq"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise ValueError(f"腾讯接口返回异常：{payload.get('msg')}")
+            node = data.get(symbol) or {}
+            rows = node.get("qfqday") or node.get("day") or []
+            if rows:
+                frames.append(pd.DataFrame([r[:6] for r in rows], columns=_KLINE_COLUMNS))
+
+    if not frames:
+        return pd.DataFrame(columns=_KLINE_COLUMNS)
+
+    df = _normalize_ohlcv(pd.concat(frames, ignore_index=True))
+    mask = (df["date"] >= pd.Timestamp(start_dt)) & (df["date"] <= pd.Timestamp(end_dt))
+    return df[mask].reset_index(drop=True)
+
+
+def _get_kline_sina(code: str, start: str, end: str) -> pd.DataFrame:
+    """源3：新浪行情（AkShare stock_zh_a_daily），成交量原始单位：股。"""
+    symbol = _to_market_symbol(code)
+    rate_limiter.wait()
+    df = ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust="qfq")
+    return _normalize_ohlcv(df, volume_in_shares=True)
+
+
+# 顺序即优先级：某源连续 3 次失败后降级到末位，成功后提升为首选，
+# 避免每只股票都在已失效的源上反复消耗重试等待。
+SOURCES = [
+    ("em", _get_kline_em),
+    ("tx", _get_kline_tx),
+    ("sina", _get_kline_sina),
+]
+_source_lock = threading.Lock()
+
+
+def _source_snapshot() -> list[tuple[str, object]]:
+    with _source_lock:
+        return list(SOURCES)
+
+
+def _promote_source(name: str) -> None:
+    with _source_lock:
+        for i, (n, _) in enumerate(SOURCES):
+            if n == name and i > 0:
+                SOURCES.insert(0, SOURCES.pop(i))
+                logger.info("数据源 %s 可用，已提升为首选源", name)
+                return
+
+
+def _demote_source(name: str) -> None:
+    with _source_lock:
+        for i, (n, _) in enumerate(SOURCES):
+            if n == name:
+                if i < len(SOURCES) - 1:
+                    SOURCES.append(SOURCES.pop(i))
+                    logger.warning("数据源 %s 连续 3 次失败，已降级到末位", name)
+                return
+
 
 def get_latest_date_from_csv(csv_path: Path) -> Optional[pd.Timestamp]:
     """从现有CSV文件获取最新交易日期。"""
@@ -203,6 +310,28 @@ def get_latest_date_from_csv(csv_path: Path) -> Optional[pd.Timestamp]:
         return dates.max()
     except Exception:
         return None
+
+
+@functools.lru_cache(maxsize=1)
+def _trading_calendar() -> Optional[pd.DatetimeIndex]:
+    """获取 A 股交易日历（AkShare 新浪源）。失败返回 None，由调用方回退。"""
+    try:
+        cal = ak.tool_trade_date_hist_sina()
+        dates = pd.to_datetime(cal["trade_date"], errors="coerce").dropna()
+        return pd.DatetimeIndex(dates.dt.normalize().unique()).sort_values()
+    except Exception as e:
+        logger.warning("获取交易日历失败，回退为按自然日判断：%s", e)
+        return None
+
+
+def latest_trading_day(today: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """返回 <= 今天的最近交易日（含今天）。日历不可用时回退为今天。"""
+    today = (today or pd.Timestamp.today()).normalize()
+    cal = _trading_calendar()
+    if cal is None or cal.empty:
+        return today
+    idx = int(cal.searchsorted(today, side="right")) - 1
+    return cal[idx] if idx >= 0 else today
 
 
 def validate(df: pd.DataFrame) -> pd.DataFrame:
@@ -242,55 +371,98 @@ def load_codes_from_stocklist(stocklist_csv: Path, exclude_boards: set[str]) -> 
     return codes
 
 # --------------------------- 单只抓取（增量更新） --------------------------- #
+_OVERLAP_DAYS = 7      # 增量抓取时多取几天重叠数据，用于校验复权基准
+_ADJUST_DRIFT_TOL = 0.01  # 重叠日期收盘价相对偏差中位数超过 1% 判定为前复权基准漂移
+
+
+def _detect_adjust_drift(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> bool:
+    """比对新旧数据重叠日期的收盘价，判断前复权基准是否已发生变化。
+
+    前复权会随最新价整体重算，除权后同一历史日期的价格会变，此时增量拼接
+    会在接缝处产生断层，必须丢弃历史数据重新全量抓取。
+    """
+    old = existing_df[["date", "close"]].copy()
+    old["date"] = pd.to_datetime(old["date"], errors="coerce")
+    merged = old.merge(new_df[["date", "close"]], on="date", suffixes=("_old", "_new"))
+    if merged.empty:
+        return False
+
+    old_close = pd.to_numeric(merged["close_old"], errors="coerce")
+    new_close = pd.to_numeric(merged["close_new"], errors="coerce")
+    valid = old_close.notna() & new_close.notna() & (old_close > 0)
+    if not valid.any():
+        return False
+
+    rel_diff = ((new_close[valid] - old_close[valid]).abs() / old_close[valid]).median()
+    return bool(rel_diff > _ADJUST_DRIFT_TOL)
+
+
 def fetch_one(
     code: str,
     start: str,
     end: str,
     out_dir: Path,
+    target_date: Optional[pd.Timestamp] = None,
 ):
     csv_path = out_dir / f"{code}.csv"
-    today = pd.Timestamp.today().normalize()
+    # 目标日期：<= 今天的最近交易日。本地数据已包含该日则无需拉取。
+    if target_date is None:
+        target_date = latest_trading_day()
+    target_date = pd.Timestamp(target_date).normalize()
     latest_existing_date = get_latest_date_from_csv(csv_path)
 
     if latest_existing_date is not None:
         latest_existing_date = latest_existing_date.normalize()
-        if latest_existing_date >= today:
-            logger.debug("%s 已是最新（最新日期: %s），跳过", code, latest_existing_date.date())
+        if latest_existing_date >= target_date:
+            logger.debug("%s 已是最新交易日数据（最新日期: %s），跳过", code, latest_existing_date.date())
             return
-        fetch_start = (latest_existing_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
+        # 多取几天重叠数据，供复权基准漂移检测使用
+        fetch_start = (latest_existing_date - pd.Timedelta(days=_OVERLAP_DAYS)).strftime("%Y%m%d")
     else:
         fetch_start = start
 
-    for attempt in range(1, 4):
-        try:
-            new_df = _get_kline_tushare(code, fetch_start, end)
-            if new_df.empty:
-                logger.debug("%s 无新数据，跳过", code)
+    for name, fetch in _source_snapshot():
+        for attempt in range(1, 4):
+            try:
+                new_df = fetch(code, fetch_start, end)
+                if new_df.empty:
+                    logger.debug("%s [%s] 无新数据，跳过", code, name)
+                    _promote_source(name)
+                    return
+
+                if latest_existing_date is not None:
+                    existing_df = pd.read_csv(csv_path)
+                    if _detect_adjust_drift(existing_df, new_df):
+                        logger.warning("%s [%s] 检测到前复权基准漂移，丢弃历史数据改为全量重抓", code, name)
+                        new_df = fetch(code, start, end)
+                        if new_df.empty:
+                            logger.error("%s [%s] 全量重抓返回空数据，保留原有文件", code, name)
+                            return
+                    else:
+                        existing_df["date"] = pd.to_datetime(existing_df["date"])
+                        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                        combined_df = combined_df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
+                        new_df = combined_df
+
+                new_df = validate(new_df)
+                new_df.to_csv(csv_path, index=False)
+                logger.debug("%s [%s] 更新完成（%s → %s）", code, name,
+                            new_df["date"].min().date() if not new_df.empty else "N/A",
+                            new_df["date"].max().date() if not new_df.empty else "N/A")
+                _promote_source(name)
                 return
-            
-            if latest_existing_date is not None:
-                existing_df = pd.read_csv(csv_path)
-                existing_df["date"] = pd.to_datetime(existing_df["date"])
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                combined_df = combined_df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
-                new_df = combined_df
-            
-            new_df = validate(new_df)
-            new_df.to_csv(csv_path, index=False)
-            logger.debug("%s 更新完成（%s → %s）", code, 
-                        new_df["date"].min().date() if not new_df.empty else "N/A",
-                        new_df["date"].max().date() if not new_df.empty else "N/A")
-            break
-        except Exception as e:
-            if _looks_like_ip_ban(e):
-                logger.error(f"{code} 第 {attempt} 次抓取疑似被封禁，沉睡 {COOLDOWN_SECS} 秒")
-                _cool_sleep(COOLDOWN_SECS)
-            else:
-                silent_seconds = 30 * attempt
-                logger.info(f"{code} 第 {attempt} 次抓取失败，{silent_seconds} 秒后重试：{e}")
-                time.sleep(silent_seconds)
-    else:
-        logger.error("%s 三次抓取均失败，已跳过！", code)       
+            except Exception as e:
+                if _looks_like_ip_ban(e):
+                    logger.error("%s [%s] 第 %d 次抓取疑似被封禁，沉睡 %d 秒", code, name, attempt, COOLDOWN_SECS)
+                    _cool_sleep(COOLDOWN_SECS)
+                else:
+                    silent_seconds = 10
+                    logger.info("%s [%s] 第 %d 次抓取失败，%d 秒后重试：%s", code, name, attempt, silent_seconds, e)
+                    time.sleep(silent_seconds)
+        logger.warning("%s 数据源 [%s] 连续 3 次失败，切换下一个源", code, name)
+        _demote_source(name)
+
+    logger.error("%s 所有数据源均抓取失败，已跳过！", code)
 
 
 
@@ -318,15 +490,6 @@ def main(log_path: Optional[Path] = None):
     setup_logging(log_path)
     logger.info("日志文件：%s", Path(log_path).resolve())
 
-    # ---------- Tushare Token ---------- #
-    os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
-    os.environ["no_proxy"] = os.environ["NO_PROXY"]
-    ts_token = os.environ.get("TUSHARE_TOKEN")
-    if not ts_token:
-        raise ValueError("请先设置环境变量 TUSHARE_TOKEN，例如：export TUSHARE_TOKEN=你的token")
-    global pro
-    pro = ts.pro_api(ts_token)
-
     # ---------- 日期解析 ---------- #
     raw_start = str(cfg.get("start", "20190101"))
     raw_end   = str(cfg.get("end",   "today"))
@@ -345,12 +508,16 @@ def main(log_path: Optional[Path] = None):
         logger.error("stocklist 为空或被过滤后无代码，请检查。")
         sys.exit(1)
 
+    # ---------- 目标最新交易日：本地数据已含该日则跳过拉取 ---------- #
+    target_date = latest_trading_day()
+    logger.info("目标最新交易日：%s（按交易日历，节假日/周末自动回退）", target_date.date())
+
     logger.info(
-        "开始抓取 %d 支股票 | 数据源:Tushare(日线,qfq) | 日期:%s → %s | 排除:%s",
+        "开始抓取 %d 支股票 | 数据源:AkShare(日线,qfq) | 日期:%s → %s | 排除:%s",
         len(codes), start, end, ",".join(sorted(exclude_boards)) or "无",
     )
 
-    # ---------- 多线程抓取（全量覆盖） ---------- #
+    # ---------- 多线程抓取（增量更新，已是最新交易日的股票自动跳过） ---------- #
     workers = int(cfg.get("workers", 8))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
@@ -360,6 +527,7 @@ def main(log_path: Optional[Path] = None):
                 start,
                 end,
                 out_dir,
+                target_date,
             )
             for code in codes
         ]

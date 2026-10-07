@@ -1,18 +1,19 @@
 """
 run_all.py
 ~~~~~~~~~~
-一键运行完整交易选股流程：
+一键运行完整交易选股流程（数据打分版）：
 
-  步骤 1  pipeline/fetch_kline.py   — 拉取最新 K 线数据
-  步骤 2  pipeline/cli.py preselect — 量化初选，生成候选列表
-  步骤 3  dashboard/export_kline_charts.py — 导出候选股 K 线图
-  步骤 4  agent/gemini_review.py    — Gemini 图表分析评分
+  步骤 1  pipeline/fetch_kline.py                    — 拉取最新 K 线数据（AkShare）
+  步骤 2  pipeline/cli.py preselect                  — 量化初选，生成候选列表
+  步骤 3  agent/prepare_review_features.py features  — 计算候选股指标卡
+  -- AI 步骤：由 Trae 读指标卡逐只打分，写入 data/review/<pick_date>/<code>.json --
+  步骤 4  agent/prepare_review_features.py aggregate — 汇总评分，生成 suggestion.json + suggestion.md
   步骤 5  打印推荐购买的股票
 
 用法：
-    python run_all.py
+    python run_all.py                  # 跑步骤 1-3，然后等待 AI 打分
     python run_all.py --skip-fetch     # 跳过行情下载（已有最新数据时）
-    python run_all.py --start-from 3   # 从第 3 步开始（跳过前两步）
+    python run_all.py --start-from 4   # AI 打分完成后，汇总并打印推荐
 """
 from __future__ import annotations
 
@@ -71,6 +72,7 @@ def _print_recommendations() -> None:
 
     if not recommendations:
         print("  暂无达标推荐股票。")
+        print(f"\n📄 复盘报告：{suggestion_file.with_suffix('.md')}")
         return
 
     header = f"{'排名':>4}  {'代码':>8}  {'总分':>6}  {'信号':>10}  {'研判':>6}  备注"
@@ -87,6 +89,29 @@ def _print_recommendations() -> None:
         print(f"{rank:>4}  {code:>8}  {score_str:>6}  {signal_type:>10}  {verdict:>6}  {comment}")
 
     print(f"\n✅ 推荐购买 {len(recommendations)} 只股票（详见 {suggestion_file}）")
+    print(f"📄 复盘报告：{suggestion_file.with_suffix('.md')}")
+
+
+def _current_pick_date() -> str:
+    """从 candidates_latest.json 读取本次选股日期。"""
+    candidates_file = ROOT / "data" / "candidates" / "candidates_latest.json"
+    if not candidates_file.exists():
+        return ""
+    with open(candidates_file, encoding="utf-8") as f:
+        return json.load(f).get("pick_date", "")
+
+
+def _print_handoff_notice() -> None:
+    """步骤 3 完成后提示：需要 AI 打分才能继续。"""
+    pick_date = _current_pick_date()
+    features_file = ROOT / "data" / "review" / pick_date / "features" / "features_all.json"
+    print(f"\n{'='*60}")
+    print("[步骤] 3/4 完成，等待 AI 打分")
+    print(f"{'='*60}")
+    print(f"  指标卡文件：{features_file}")
+    print(f"  请让 Trae 读取该文件，按 agent/prompt.md 的标准逐只打分，")
+    print(f"  并写入 data/review/{pick_date}/<code>.json（每只一个文件）。")
+    print("  完成后执行：python run_all.py --start-from 4")
 
 
 def main() -> None:
@@ -102,41 +127,38 @@ def main() -> None:
     args = parser.parse_args()
 
     start = args.start_from
-    
+
     if args.skip_fetch and start == 1:
         start = 2
 
-    # ── 步骤 1：拉取 K 线数据 ─────────────────────────────────────────
-    if start <= 1:
-        _run(
-            "1/4  拉取 K 线数据（fetch_kline）",
-            [PYTHON, "-m", "pipeline.fetch_kline"],
-        )
-
-    # ── 步骤 2：量化初选 ─────────────────────────────────────────────
-    if start <= 2:
-        _run(
-            "2/4  量化初选（cli preselect）",
-            [PYTHON, "-m", "pipeline.cli", "preselect"],
-        )
-
-    # ── 步骤 3：导出 K 线图 ──────────────────────────────────────────
+    # ── 步骤 1-3：行情 → 初选 → 指标卡（可自动执行） ─────────────────────
     if start <= 3:
+        if start <= 1:
+            _run(
+                "1/4  拉取 K 线数据（fetch_kline）",
+                [PYTHON, "-m", "pipeline.fetch_kline"],
+            )
+        if start <= 2:
+            _run(
+                "2/4  量化初选（cli preselect）",
+                [PYTHON, "-m", "pipeline.cli", "preselect"],
+            )
         _run(
-            "3/4  导出 K 线图（export_kline_charts）",
-            [PYTHON, str(ROOT / "dashboard" / "export_kline_charts.py")],
+            "3/4  生成指标卡（prepare_review_features features）",
+            [PYTHON, str(ROOT / "agent" / "prepare_review_features.py"), "features"],
         )
+        _print_handoff_notice()
+        return
 
-    # ── 步骤 4：TRADE 内置 AI 图表分析 ──────────────────────────────────────
-    if start <= 4:
-        _run(
-            "4/4  TRADE 内置 AI 图表分析（trae_review）",
-            [PYTHON, str(ROOT / "agent" / "trae_review.py")],
-        )
+    # ── 步骤 4：AI 打分已完成，汇总评分 ───────────────────────────────
+    _run(
+        "4/4  汇总推荐（prepare_review_features aggregate）",
+        [PYTHON, str(ROOT / "agent" / "prepare_review_features.py"), "aggregate"],
+    )
 
     # ── 步骤 5：打印推荐结果 ─────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("[步骤] 5/5  推荐购买的股票")
+    print(f"[步骤] 5/5  推荐购买的股票")
     _print_recommendations()
 
 

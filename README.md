@@ -2,7 +2,7 @@
 
 一个面向 A 股的半自动选股项目：
 
-- 使用 Tushare 拉取股票日线数据
+- 使用 AkShare 拉取股票日线数据
 - 用量化规则做初选（目前只实现了B1选股）
 - 导出候选股票 K 线图
 - 调用 Gemini 对图表进行 AI 复评打分
@@ -67,9 +67,10 @@ pip install -r requirements.txt
 Windows PowerShell（永久写入）：
 
 ~~~powershell
-[Environment]::SetEnvironmentVariable("TUSHARE_TOKEN", "你的TushareToken", "User")
 [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "你的GeminiApiKey", "User")
 ~~~
+
+行情数据由 AkShare 免费提供，无需配置 token。
 
 写入后请重开终端，环境变量才会在新会话中生效。
 
@@ -200,10 +201,11 @@ data/review/日期/suggestion.json
 
 ## 7. 常见问题
 
-### Q1：fetch_kline 报 token 错误
+### Q1：fetch_kline 抓取失败
 
-- 检查 TUSHARE_TOKEN 是否已设置
-- 确认 token 有效且账号权限正常
+- AkShare 无需 token，报错通常是网络异常或东财接口临时限流
+- 可升级版本：pip install akshare --upgrade
+- 适当调大 fetch_kline.py 中 rate_limiter 的请求间隔
 
 ### Q2：导出图表时报 write_image 错误
 

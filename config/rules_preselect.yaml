@@ -55,3 +55,61 @@ brick:
   wma_short: 5
   wma_mid: 10
   wma_long: 20
+
+# ── 选股公式（f1~f5，各自独立、命中任一即入选、取并集） ────────────────
+formulas:
+  enabled: true
+  warmup_bars: 400          # 周线指标预热所需日线 bar 数
+  kdj_n: 9                  # KDJ 周期（阈值均指 J 值）
+
+  macd:                     # MACD 参数（DIF = EMA快 - EMA慢，DEA = EMA(DIF)）
+    fast: 12
+    slow: 26
+    signal: 9
+
+  bbi:                      # BBI = (MA3 + MA6 + MA12 + MA24) / 4
+    periods: [3, 6, 12, 24]
+
+  # f1: J<12; -2<涨跌幅<2; (DIF>0 或 DEA>0); BBI>60日线
+  f1:
+    enabled: true
+    j_max: 12
+    chg_min: -2
+    chg_max: 2
+    bbi_ma: 60
+
+  # f2: DIF>0 且 DEA>0; (DIF<0.2 或 DEA<0.2); J<20; DIF<DEA; BBI>60日线; -2<涨跌幅<2
+  f2:
+    enabled: true
+    j_max: 20
+    dif_dea_abs_max: 0.2
+    chg_min: -2
+    chg_max: 2
+    bbi_ma: 60
+
+  # f3: (DIF<0 或 DEA<0); DIF>DEA; J<30; BBI>5日线
+  f3:
+    enabled: true
+    j_max: 30
+    bbi_ma: 5
+
+  # f4: 日线 J<10; 周线 J<0
+  f4:
+    enabled: true
+    daily_j_max: 10
+    weekly_j_max: 0
+
+  # f5: 周线 DIF 上穿 DEA; (周线 DIF>0 或 周线 DEA>0); 周线 BBI>60日线
+  f5:
+    enabled: true
+    bbi_ma: 60
+    cross_lookback_weeks: 1  # 金叉需出现在最近 N 根周线内
+
+  # 每条公式内按成交额降序取前 N 只，再取并集（控制候选规模）。
+  # 未列出的公式不做截断；留空 {} 表示不启用截断。
+  max_per_formula:
+    f1: 5
+    f2: 5
+    f3: 5
+    f4: 10
+    f5: 5

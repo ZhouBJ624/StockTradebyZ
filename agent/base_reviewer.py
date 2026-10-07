@@ -55,6 +55,14 @@ class BaseReviewer:
         """子类需实现此方法，调用具体的 LLM 进行打分，并返回 JSON 解析字典。"""
         raise NotImplementedError("子类必须实现 review_stock 方法")
 
+    @staticmethod
+    def _formulas_of(r: dict) -> List[str]:
+        """取一条结果的来源公式标签（formulas 优先，缺失时回退 strategy）。"""
+        formulas = list(r.get("formulas") or [])
+        if not formulas and r.get("strategy"):
+            formulas = [r["strategy"]]
+        return [str(x) for x in formulas]
+
     def generate_suggestion(self, pick_date: str, all_results: List[dict], min_score: float) -> dict:
         passed = [r for r in all_results if r.get("total_score", 0) >= min_score]
         excluded = [r["code"] for r in all_results if r.get("total_score", 0) < min_score]
@@ -65,6 +73,8 @@ class BaseReviewer:
             {
                 "rank": i + 1,
                 "code": r["code"],
+                "strategy": r.get("strategy", ""),
+                "formulas": self._formulas_of(r),
                 "verdict": r.get("verdict", ""),
                 "total_score": r.get("total_score", 0),
                 "signal_type": r.get("signal_type", ""),
@@ -73,12 +83,23 @@ class BaseReviewer:
             for i, r in enumerate(passed)
         ]
 
+        # 按单个公式统计：命中数 / 推荐数
+        by_formula: Dict[str, Dict[str, int]] = {}
+        for r in all_results:
+            hit = r.get("total_score", 0) >= min_score
+            for token in self._formulas_of(r) or ["unspecified"]:
+                bucket = by_formula.setdefault(token, {"hits": 0, "recommended": 0})
+                bucket["hits"] += 1
+                if hit:
+                    bucket["recommended"] += 1
+
         return {
             "date": pick_date,
             "min_score_threshold": min_score,
             "total_reviewed": len(all_results),
             "recommendations": recommendations,
             "excluded": excluded,
+            "by_formula": by_formula,
         }
 
     def run(self):

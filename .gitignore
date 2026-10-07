@@ -12,7 +12,8 @@ data/
 models/
 llama-cpu/
 llama-vulkan/
-
+ .trae/
+ 
 # Virtual environments
 .venv/
 venv/
